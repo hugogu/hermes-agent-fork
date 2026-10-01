@@ -232,6 +232,9 @@ _RICH_BLOCK_TAGS = {
 _SKIP_TEXT_KEYS = {
     "tag", "type", "msg_type", "message_type", "chat_id", "open_chat_id", "share_chat_id", "file_key", "image_key",
     "user_id", "open_id", "union_id", "url", "href", "link", "token", "template", "locale",
+    # CardKit v2 element-kind keys — their string values ("markdown", "text_run",
+    # …) are structural, not content; without these they leak in as noise lines.
+    "tag_type", "element_type",
 }
 
 
@@ -735,7 +738,20 @@ def _normalize_share_chat_message(payload: Dict[str, Any]) -> FeishuNormalizedMe
 
 
 def _normalize_interactive_message(message_type: str, payload: Dict[str, Any]) -> FeishuNormalizedMessage:
-    card_payload = payload.get("card") if isinstance(payload.get("card"), dict) else payload
+    # Some gateways double-encode the card: ``content`` is ``{"card": "<json string>"}``.
+    # Without decoding the inner string, the walk sees a bare string at the ``card``
+    # key and drops everything (``[Interactive message]`` fallback).
+    card_value = payload.get("card")
+    card_payload: Any = card_value
+    if isinstance(card_value, str):
+        try:
+            decoded = json.loads(card_value)
+            if isinstance(decoded, dict):
+                card_payload = decoded
+        except (ValueError, TypeError):
+            card_payload = None
+    if not isinstance(card_payload, dict):
+        card_payload = payload
     title = _first_non_empty_text(
         _find_header_title(card_payload), payload.get("title"),
         _find_first_text(card_payload, keys=("title", "summary", "subtitle")),
@@ -746,7 +762,7 @@ def _normalize_interactive_message(message_type: str, payload: Dict[str, Any]) -
         lines.append(f"Actions: {', '.join(actions)}")
     return FeishuNormalizedMessage(
         raw_type=message_type,
-        text_content="\n".join(lines[:12]).strip() or FALLBACK_INTERACTIVE_TEXT,
+        text_content="\n".join(lines[:50]).strip() or FALLBACK_INTERACTIVE_TEXT,
         relation_kind="interactive", metadata={"title": title, "actions": actions},
     )
 
@@ -784,7 +800,14 @@ def _collect_forward_entries(payload: Dict[str, Any]) -> List[str]:
 
 def _collect_card_lines(payload: Any) -> List[str]:
     lines = _collect_text_segments(payload, in_rich_block=False)
-    normalized = [_normalize_feishu_text(line) for line in lines]
+    # Split embedded newlines so the line cap in _normalize_interactive_message
+    # counts real lines, not multi-line blocks (a single markdown element often
+    # carries a whole document).
+    normalized = [
+        part
+        for line in lines
+        for part in _normalize_feishu_text(line).split("\n")
+    ]
     return _unique_lines([line for line in normalized if line])
 
 
@@ -793,7 +816,12 @@ def _collect_action_labels(payload: Any) -> List[str]:
     for item in _walk_nodes(payload):
         if not isinstance(item, dict):
             continue
-        tag = str(item.get("tag", "") or item.get("type", "")).strip().lower()
+        # v2 repurposes ``type`` as a style attr (e.g. button ``type: "primary"``),
+        # so element-kind keys must be tried before it.
+        tag = str(
+            item.get("tag", "") or item.get("tag_type", "") or item.get("element_type", "")
+            or item.get("type", "")
+        ).strip().lower()
         if tag not in {"button", "select_static", "overflow", "date_picker", "picker"}:
             continue
         label = _first_text_field(item, "text", "name", "value", deep=("text", "content", "name", "value"))
@@ -809,8 +837,23 @@ def _collect_text_segments(value: Any, *, in_rich_block: bool) -> List[str]:
         return [seg for item in value for seg in _collect_text_segments(item, in_rich_block=in_rich_block)]
     if not isinstance(value, dict):
         return []
-    tag = str(value.get("tag", "") or value.get("type", "")).strip().lower()
-    next_in_rich_block = in_rich_block or tag in _RICH_BLOCK_TAGS
+    # CardKit v2 writes the element kind under ``tag_type`` / ``element_type``
+    # instead of ``tag`` / ``type`` — without these the walk never enters a rich
+    # block and every text segment is silently dropped. Any dict carrying a v2
+    # element key is treated as a rich-block entry (covers nested shapes like
+    # ``{"element_type": "text_run", "text_run": {"content": ...}}``).
+    # v2 repurposes ``type`` as a style attr (e.g. button ``type: "primary"``),
+    # so element-kind keys are tried before it.
+    tag = str(
+        value.get("tag", "") or value.get("tag_type", "") or value.get("element_type", "")
+        or value.get("type", "")
+    ).strip().lower()
+    next_in_rich_block = (
+        in_rich_block
+        or tag in _RICH_BLOCK_TAGS
+        or "tag_type" in value
+        or "element_type" in value
+    )
     segments: List[str] = []
     if next_in_rich_block:
         for key in _SUPPORTED_CARD_TEXT_KEYS:
